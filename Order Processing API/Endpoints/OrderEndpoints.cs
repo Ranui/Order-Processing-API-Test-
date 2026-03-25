@@ -17,13 +17,24 @@ public static class OrderEndpoints
     // POST Generic
     private static async Task<IResult> CreateOrder(CreateOrderDto dto, AppDbContext db)
     {
-        var productIds = dto.Items.Select(i => i.ProductId).ToList();
-        var products = await db.Products
-            .Where(p => productIds.Contains(p.Id))
-            .ToListAsync();
+        // Req 1: at least one item
+        if (dto.Items.Count == 0)
+            return Results.BadRequest("An order must contain at least one item.");
+        
+        // Req 2: all quantities > 0
+        var invalidItems = dto.Items.Where(i => i.Quantity <= 0).ToList();
+        if (invalidItems.Count > 0)
+            return Results.BadRequest($"Item(s) with ProductId [{string.Join(", ", invalidItems.Select(i => i.ProductId))}] have an invalid quantity.");
 
-        if (products.Count != dto.Items.Count)
-            return Results.BadRequest("One or more products were not found.");
+        // Req 3: all products must exist
+        var requestedIds = dto.Items.Select(i => i.ProductId).ToList();
+        var foundProducts = await db.Products
+            .Where(p => requestedIds.Contains(p.Id))
+            .ToListAsync();
+        
+        var missingIds = requestedIds.Except(foundProducts.Select(p => p.Id)).ToList();
+        if (missingIds.Count > 0)
+            return Results.NotFound($"Product(s) not found: [{string.Join(", ", missingIds)}].");
 
         var order = new Order
         {
@@ -32,7 +43,7 @@ public static class OrderEndpoints
             CreatedAtUtc = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ssZ"),
             OrderItems = dto.Items.Select(i =>
             {
-                var product = products.First(p => p.Id == i.ProductId);
+                var product = foundProducts.First(p => p.Id == i.ProductId);
                 return new OrderItem
                 {
                     ProductId = product.Id,
@@ -60,7 +71,7 @@ public static class OrderEndpoints
             .FirstOrDefaultAsync(o => o.Id == id);
 
         if (order is null)
-            return Results.NotFound();
+            return Results.NotFound($"Order {id} not found.");
 
         return Results.Ok(MapToDto(order));
     }
@@ -69,13 +80,41 @@ public static class OrderEndpoints
     // POST confirmed order
     private static async Task<IResult> ConfirmOrder(int id, AppDbContext db)
     {
-        var order = await db.Orders.FindAsync(id);
+        var order = await db.Orders
+            .Include(o => o.OrderItems)
+            .FirstOrDefaultAsync(o => o.Id == id);
 
         if (order is null)
-            return Results.NotFound();
+            return Results.NotFound($"Order {id} not found.");
 
+        // Req 7-8: status gate
         if (order.Status != "Draft")
             return Results.Conflict($"Order cannot be confirmed from status '{order.Status}'.");
+        
+        // Req 5: check ALL items before touching anything
+        var productIds = order.OrderItems.Select(i => i.ProductId).ToList();
+        var products = await db.Products
+            .Where(p => productIds.Contains(p.Id))
+            .ToListAsync();
+        
+        var insufficientStock = order.OrderItems
+            .Where(i =>
+            {
+                var product = products.First(p => p.Id == i.ProductId);
+                return product.AvailableStock < i.Quantity;
+            })
+            .Select(i => $"{i.ProductId} (requested {i.Quantity}, available {products.First(p => p.Id == i.ProductId).AvailableStock})")
+            .ToList();
+        
+        if (insufficientStock.Count > 0)
+            return Results.Conflict($"Insufficient stock for: [{string.Join(", ", insufficientStock)}].");
+
+        // Req 6: only reduce stock after ALL checks pass
+        foreach (var item in order.OrderItems)
+        {
+            var product = products.First(p => p.Id == item.ProductId);
+            product.AvailableStock -= item.Quantity;
+        }
 
         order.Status = "Confirmed";
         order.ConfirmedAtUtc = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ssZ");
@@ -87,16 +126,29 @@ public static class OrderEndpoints
     // POST cancel order
     private static async Task<IResult> CancelOrder(int id, AppDbContext db)
     {
-        var order = await db.Orders.FindAsync(id);
+        var order = await db.Orders
+            .Include(o => o.OrderItems)
+            .FirstOrDefaultAsync(o => o.Id == id);
 
         if (order is null)
-            return Results.NotFound();
+            return Results.NotFound($"Order {id} not found.");
 
         if (order.Status == "Cancelled")
             return Results.Conflict("Order is already cancelled.");
 
         if (order.Status == "Confirmed")
-            return Results.Conflict("Confirmed orders cannot be cancelled.");
+        {
+            var productIds = order.OrderItems.Select(i => i.ProductId).ToList();
+            var products = await db.Products
+                .Where(p => productIds.Contains(p.Id))
+                .ToListAsync();
+
+            foreach (var item in order.OrderItems)
+            {
+                var product = products.First(p => p.Id == item.ProductId);
+                product.AvailableStock += item.Quantity;
+            }
+        }
 
         order.Status = "Cancelled";
         order.CancelledAtUtc = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ssZ");
